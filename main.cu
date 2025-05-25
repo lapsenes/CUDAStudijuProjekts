@@ -13,7 +13,7 @@
 #define INPUT_DIM   784    // 28x28 images for MNIST
 #define HIDDEN_DIM  128
 #define OUTPUT_DIM  10
-#define EPOCHS      200
+#define EPOCHS      100
 #define LR          0.0001f
 #define TRAIN_RATIO 0.8f
 #define CLIP_VALUE  5.0f
@@ -30,6 +30,7 @@
     }                                                                          \
   } while (0)
 
+
   bool read_mnist_csv(const std::string& filename, std::vector<float>& X, std::vector<int>& y) {
     std::ifstream file(filename);
     if (!file.is_open()) return false;
@@ -40,38 +41,38 @@
         return false;
 
     while (std::getline(file, line)) {
-        if (line.empty()) continue;                // skip blank lines
+        if (line.empty()) continue;  // Skip blank lines
         std::stringstream ss(line);
         std::string val;
         int col = 0;
-        std::vector<float> sample(INPUT_DIM);
+        std::vector<float> sample(INPUT_DIM);  // Assuming INPUT_DIM is the number of pixel columns
         int label = 0;
 
         while (std::getline(ss, val, ',')) {
-            if (col < INPUT_DIM) {
-                try {
-                    sample[col] = std::stof(val) / 255.0f;
-                } catch (...) {
-                    sample[col] = 0.0f;
-                }
-            } else if (col == INPUT_DIM) {
+            if (col == 0) {  // Label is the first column
                 try {
                     label = std::stoi(val);
                 } catch (...) {
-                    label = 0;
+                    label = 0;  // Handle invalid label values
+                }
+            } else {  // Features are the remaining columns
+                try {
+                    sample[col - 1] = std::stof(val) / 255.0f;  // Normalize pixel values between 0 and 1
+                } catch (...) {
+                    sample[col - 1] = 0.0f;  // Handle invalid pixel values
                 }
             }
             ++col;
         }
 
-        // Only accept rows with at least INPUT_DIM+1 columns
-        if (col >= INPUT_DIM + 1) {
-            X.insert(X.end(), sample.begin(), sample.end());
-            y.push_back(label);
-        }
+        // Add the sample to the data vector X and the label to y
+        X.insert(X.end(), sample.begin(), sample.end());
+        y.push_back(label);
     }
+
     return true;
 }
+
 
 
 void test_model(float* X_test, float* W1, float* b1, float* W2, float* b2,
@@ -112,10 +113,12 @@ void test_model(float* X_test, float* W1, float* b1, float* W2, float* b2,
 int main() {
     std::vector<float> full_X;
     std::vector<int>   full_y;
-    if (!read_mnist_csv("mnist.csv", full_X, full_y)) {
+    if (!read_mnist_csv("data/mnist.csv", full_X, full_y)) {
         std::cerr << "Failed to load mnist.csv\n";
         return 1;
     }
+
+    
 
     int total_samples = full_y.size();
     int train_samples = int(total_samples * TRAIN_RATIO);
@@ -261,7 +264,7 @@ int main() {
         for (int i = 0; i < OUTPUT_DIM; ++i)
           b2[i] -= LR*fminf(fmaxf(db2[i], -CLIP_VALUE), CLIP_VALUE);
 
-        if (epoch % 100 == 0 || epoch == EPOCHS-1) {
+        if (epoch % 10 == 0 || epoch == EPOCHS-1) {
           compute_accuracy_cuda(probs, d_y_train, correct_array, train_samples, OUTPUT_DIM);
           CUDA_CHECK(cudaDeviceSynchronize());
           int correct = 0;
