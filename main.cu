@@ -20,11 +20,14 @@
 #define LR 0.1f
 #define TRAIN_RATIO 0.8f
 
+// value mapping for labels
 std::unordered_map<std::string, int> label_map = {
     {"Iris-setosa", 0},
     {"Iris-versicolor", 1},
     {"Iris-virginica", 2}
 };
+
+
 
 std::string trim(const std::string& s) {
     size_t start = s.find_first_not_of(" \t\r\n");
@@ -32,7 +35,7 @@ std::string trim(const std::string& s) {
     return (start == std::string::npos) ? "" : s.substr(start, end - start + 1);
 }
 
-bool read_csv_data(const std::string& filename, std::vector<float>& X, std::vector<int>& y) {
+bool read_csv_data(const std::string& filename, std::vector<float>& X, std::vector<int>& y) { // reads in all feature columns and labels (which get encoded based on label_map)
     std::ifstream file(filename);
     if (!file.is_open()) return false;
     std::string line;
@@ -41,7 +44,7 @@ bool read_csv_data(const std::string& filename, std::vector<float>& X, std::vect
         std::stringstream ss(line);
         std::string val;
         int col = 0;
-        std::vector<float> sample(INPUT_DIM);
+        std::vector<float> sample(INPUT_DIM); // size is tied to the set input dimension (col count)
         std::string label;
         while (std::getline(ss, val, ',')) {
             val = trim(val);
@@ -52,11 +55,11 @@ bool read_csv_data(const std::string& filename, std::vector<float>& X, std::vect
                     sample[col] = 0;
                 }
             } else {
-                label = val;
+                label = val; // if the column is the label one
             }
             col++;
         }
-        if (col == INPUT_DIM + 1 && label_map.count(label)) {
+        if (col == INPUT_DIM + 1 && label_map.count(label)) { // label gets encoded
             X.insert(X.end(), sample.begin(), sample.end());
             y.push_back(label_map[label]);
         }
@@ -64,10 +67,18 @@ bool read_csv_data(const std::string& filename, std::vector<float>& X, std::vect
     return true;
 }
 
+
+
+
+
+// main
+
+
+
 int main() {
     std::vector<float> full_X;
     std::vector<int> full_y;
-    if (!read_csv_data("iris.csv", full_X, full_y)) {
+    if (!read_csv_data("iris.csv", full_X, full_y)) { // load the specific dataset
         std::cerr << "Failed to load iris.csv\n";
         return 1;
     }
@@ -76,43 +87,51 @@ int main() {
     int train_samples = static_cast<int>(total_samples * TRAIN_RATIO);
     int test_samples = total_samples - train_samples;
 
-    std::vector<std::pair<std::vector<float>, int>> dataset(total_samples);
+    std::vector<std::pair<std::vector<float>, int>> dataset(total_samples); // dataset of pairs (floats + int) of size total_samples
     for (int i = 0; i < total_samples; ++i) {
-        dataset[i].first = std::vector<float>(full_X.begin() + i * INPUT_DIM, full_X.begin() + (i + 1) * INPUT_DIM);
-        dataset[i].second = full_y[i];
+        dataset[i].first = std::vector<float>(full_X.begin() + i * INPUT_DIM, full_X.begin() + (i + 1) * INPUT_DIM); // feature vector
+        dataset[i].second = full_y[i]; // encoded class
     }
 
-    std::srand(static_cast<unsigned>(time(nullptr)));
-    for (int i = dataset.size() - 1; i > 0; --i) {
+    std::srand(static_cast<unsigned>(time(nullptr))); // enable random shuffle, not seeded
+
+    // dataset is ordered, needs to be shuffled
+    for (int i = dataset.size() - 1; i > 0; --i) { // fisher-yates shuffle algorithm
         int j = std::rand() % (i + 1);
         std::swap(dataset[i], dataset[j]);
     }
 
-    std::vector<float> X_train(train_samples * INPUT_DIM);
+    // flat array init for storing train and test data 
+    std::vector<float> X_train(train_samples * INPUT_DIM); // to accomodate for all features
     std::vector<int> y_train(train_samples);
     std::vector<float> X_test(test_samples * INPUT_DIM);
     std::vector<int> y_test(test_samples);
 
-    for (int i = 0; i < train_samples; ++i) {
-        for (int j = 0; j < INPUT_DIM; ++j)
+    // populating training data from the read-in dataset 
+    for (int i = 0; i < train_samples; ++i) { // for each sample
+        for (int j = 0; j < INPUT_DIM; ++j) // for each column
             X_train[i * INPUT_DIM + j] = dataset[i].first[j];
         y_train[i] = dataset[i].second;
     }
+
+    // populating testing data from the read-in dataset 
     for (int i = 0; i < test_samples; ++i) {
         for (int j = 0; j < INPUT_DIM; ++j)
             X_test[i * INPUT_DIM + j] = dataset[train_samples + i].first[j];
         y_test[i] = dataset[train_samples + i].second;
     }
 
-    for (int j = 0; j < INPUT_DIM; ++j) {
+
+    for (int j = 0; j < INPUT_DIM; ++j) { // for each column
         float sum = 0, sum_sq = 0;
-        for (int i = 0; i < train_samples; ++i) {
-            float val = X_train[i * INPUT_DIM + j];
-            sum += val;
+        for (int i = 0; i < train_samples; ++i) { // for each sample
+            float val = X_train[i * INPUT_DIM + j]; // because of the 1D array
+            sum += val; 
             sum_sq += val * val;
         }
         float mean = sum / train_samples;
         float std = std::sqrt(sum_sq / train_samples - mean * mean + 1e-8f);
+        // normalizing both training and test data using only training data statistics
         for (int i = 0; i < train_samples; ++i)
             X_train[i * INPUT_DIM + j] = (X_train[i * INPUT_DIM + j] - mean) / std;
         for (int i = 0; i < test_samples; ++i)
