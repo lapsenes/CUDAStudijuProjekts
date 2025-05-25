@@ -1,0 +1,5 @@
+Data Loading Time: 0.000290401s
+Normalization Time: 4.268e-06s
+Training Time: 0.0665917s
+Testing Time: 0.000124226s
+Test Accuracy: 1

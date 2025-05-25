@@ -1,4 +1,3 @@
-// main.cu - GPU version of 2-layer neural network for Iris classification
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -19,6 +18,7 @@
 #define EPOCHS 600
 #define LR 0.1f
 #define TRAIN_RATIO 0.8f
+#define SCALE_FACTOR 1.0f // Scaling factor for input data
 
 // value mapping for labels
 std::unordered_map<std::string, int> label_map = {
@@ -27,15 +27,13 @@ std::unordered_map<std::string, int> label_map = {
     {"Iris-virginica", 2}
 };
 
-
-
 std::string trim(const std::string& s) {
     size_t start = s.find_first_not_of(" \t\r\n");
     size_t end = s.find_last_not_of(" \t\r\n");
     return (start == std::string::npos) ? "" : s.substr(start, end - start + 1);
 }
 
-bool read_csv_data(const std::string& filename, std::vector<float>& X, std::vector<int>& y) { // reads in all feature columns and labels (which get encoded based on label_map)
+bool read_csv_data(const std::string& filename, std::vector<float>& X, std::vector<int>& y) { 
     std::ifstream file(filename);
     if (!file.is_open()) return false;
     std::string line;
@@ -44,7 +42,7 @@ bool read_csv_data(const std::string& filename, std::vector<float>& X, std::vect
         std::stringstream ss(line);
         std::string val;
         int col = 0;
-        std::vector<float> sample(INPUT_DIM); // size is tied to the set input dimension (col count)
+        std::vector<float> sample(INPUT_DIM); 
         std::string label;
         while (std::getline(ss, val, ',')) {
             val = trim(val);
@@ -55,11 +53,11 @@ bool read_csv_data(const std::string& filename, std::vector<float>& X, std::vect
                     sample[col] = 0;
                 }
             } else {
-                label = val; // if the column is the label one
+                label = val; 
             }
             col++;
         }
-        if (col == INPUT_DIM + 1 && label_map.count(label)) { // label gets encoded
+        if (col == INPUT_DIM + 1 && label_map.count(label)) { 
             X.insert(X.end(), sample.begin(), sample.end());
             y.push_back(label_map[label]);
         }
@@ -67,76 +65,78 @@ bool read_csv_data(const std::string& filename, std::vector<float>& X, std::vect
     return true;
 }
 
-
-
-
-
 // main
-
-
-
 int main() {
     std::vector<float> full_X;
     std::vector<int> full_y;
-    if (!read_csv_data("iris.csv", full_X, full_y)) { // load the specific dataset
+    
+    // Timing the data loading
+    auto data_load_start = std::chrono::high_resolution_clock::now();
+    if (!read_csv_data("iris.csv", full_X, full_y)) { 
         std::cerr << "Failed to load iris.csv\n";
         return 1;
     }
+    auto data_load_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> data_load_time = data_load_end - data_load_start;
+    std::cout << "Data Loading Time: " << data_load_time.count() << "s\n";
 
     int total_samples = full_y.size();
     int train_samples = static_cast<int>(total_samples * TRAIN_RATIO);
     int test_samples = total_samples - train_samples;
 
-    std::vector<std::pair<std::vector<float>, int>> dataset(total_samples); // dataset of pairs (floats + int) of size total_samples
+    std::vector<std::pair<std::vector<float>, int>> dataset(total_samples);
     for (int i = 0; i < total_samples; ++i) {
-        dataset[i].first = std::vector<float>(full_X.begin() + i * INPUT_DIM, full_X.begin() + (i + 1) * INPUT_DIM); // feature vector
-        dataset[i].second = full_y[i]; // encoded class
+        dataset[i].first = std::vector<float>(full_X.begin() + i * INPUT_DIM, full_X.begin() + (i + 1) * INPUT_DIM); 
+        dataset[i].second = full_y[i]; 
     }
 
-    std::srand(static_cast<unsigned>(time(nullptr))); // enable random shuffle, not seeded
+    std::srand(static_cast<unsigned>(time(nullptr)));
 
-    // dataset is ordered, needs to be shuffled
-    for (int i = dataset.size() - 1; i > 0; --i) { // fisher-yates shuffle algorithm
+    // dataset shuffling
+    for (int i = dataset.size() - 1; i > 0; --i) {
         int j = std::rand() % (i + 1);
         std::swap(dataset[i], dataset[j]);
     }
 
-    // flat array init for storing train and test data 
-    std::vector<float> X_train(train_samples * INPUT_DIM); // to accomodate for all features
+    std::vector<float> X_train(train_samples * INPUT_DIM); 
     std::vector<int> y_train(train_samples);
     std::vector<float> X_test(test_samples * INPUT_DIM);
     std::vector<int> y_test(test_samples);
 
-    // populating training data from the read-in dataset 
-    for (int i = 0; i < train_samples; ++i) { // for each sample
-        for (int j = 0; j < INPUT_DIM; ++j) // for each column
+    // populate training and testing data
+    for (int i = 0; i < train_samples; ++i) { 
+        for (int j = 0; j < INPUT_DIM; ++j) 
             X_train[i * INPUT_DIM + j] = dataset[i].first[j];
         y_train[i] = dataset[i].second;
     }
 
-    // populating testing data from the read-in dataset 
     for (int i = 0; i < test_samples; ++i) {
         for (int j = 0; j < INPUT_DIM; ++j)
             X_test[i * INPUT_DIM + j] = dataset[train_samples + i].first[j];
         y_test[i] = dataset[train_samples + i].second;
     }
 
-
-    for (int j = 0; j < INPUT_DIM; ++j) { // for each column
+    // Timing the normalization
+    auto normalization_start = std::chrono::high_resolution_clock::now();
+    for (int j = 0; j < INPUT_DIM; ++j) {
         float sum = 0, sum_sq = 0;
-        for (int i = 0; i < train_samples; ++i) { // for each sample
-            float val = X_train[i * INPUT_DIM + j]; // because of the 1D array
-            sum += val; 
+        for (int i = 0; i < train_samples; ++i) {
+            float val = X_train[i * INPUT_DIM + j];
+            sum += val;
             sum_sq += val * val;
         }
         float mean = sum / train_samples;
         float std = std::sqrt(sum_sq / train_samples - mean * mean + 1e-8f);
-        // normalizing both training and test data using only training data statistics
+
+        // scaling the data
         for (int i = 0; i < train_samples; ++i)
-            X_train[i * INPUT_DIM + j] = (X_train[i * INPUT_DIM + j] - mean) / std;
+            X_train[i * INPUT_DIM + j] = (X_train[i * INPUT_DIM + j] - mean) / std * SCALE_FACTOR;
         for (int i = 0; i < test_samples; ++i)
-            X_test[i * INPUT_DIM + j] = (X_test[i * INPUT_DIM + j] - mean) / std;
+            X_test[i * INPUT_DIM + j] = (X_test[i * INPUT_DIM + j] - mean) / std * SCALE_FACTOR;
     }
+    auto normalization_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> normalization_time = normalization_end - normalization_start;
+    std::cout << "Normalization Time: " << normalization_time.count() << "s\n";
 
     float *W1, *b1, *W2, *b2;
     cudaMallocManaged(&W1, INPUT_DIM * HIDDEN_DIM * sizeof(float));
@@ -151,6 +151,7 @@ int main() {
     for (int i = 0; i < HIDDEN_DIM * OUTPUT_DIM; ++i) W2[i] = dist(rng);
     for (int i = 0; i < OUTPUT_DIM; ++i) b2[i] = 0.0f;
 
+    // Memory allocation
     float *X, *hidden, *logits, *probs, *dY;
     cudaMallocManaged(&X, train_samples * INPUT_DIM * sizeof(float));
     cudaMallocManaged(&hidden, train_samples * HIDDEN_DIM * sizeof(float));
@@ -167,12 +168,15 @@ int main() {
     cudaMallocManaged(&d_y_test, test_samples * sizeof(int));
     std::copy(y_test.begin(), y_test.end(), d_y_test);
 
+
+    // Memory allocation for gradients
     float *dW1, *db1, *dW2, *db2;
     cudaMallocManaged(&dW1, INPUT_DIM * HIDDEN_DIM * sizeof(float));
     cudaMallocManaged(&db1, HIDDEN_DIM * sizeof(float));
     cudaMallocManaged(&dW2, HIDDEN_DIM * OUTPUT_DIM * sizeof(float));
     cudaMallocManaged(&db2, OUTPUT_DIM * sizeof(float));
 
+    // Loss and accuracy reporting
     float lambda = 1e-4f;
     float clip = 1.0f;
 
@@ -181,7 +185,9 @@ int main() {
     int* correct_array;
     cudaMallocManaged(&correct_array, train_samples * sizeof(int));
 
-    auto start = std::chrono::high_resolution_clock::now();
+    // Time for training
+    auto training_start = std::chrono::high_resolution_clock::now();
+
     for (int epoch = 0; epoch < EPOCHS; ++epoch) {
         dense_forward(X, W1, b1, hidden, train_samples, INPUT_DIM, HIDDEN_DIM);
         relu_forward(hidden, train_samples * HIDDEN_DIM);
@@ -210,9 +216,13 @@ int main() {
             std::cout << "Epoch " << epoch << " - Loss: " << loss << ", Accuracy: " << acc << std::endl;
         }
     }
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = end - start;
-    std::cout << "\nGPU Training time: " << elapsed.count() << "s" << std::endl;
+
+    auto training_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> training_time = training_end - training_start;
+    std::cout << "Training Time: " << training_time.count() << "s\n";
+
+    // Time for testing
+    auto testing_start = std::chrono::high_resolution_clock::now();
 
     float* Xtest_dev, *Htest, *Ltest, *SoftTest;
     cudaMallocManaged(&Xtest_dev, test_samples * INPUT_DIM * sizeof(float));
@@ -233,8 +243,22 @@ int main() {
     for (int i = 0; i < test_samples; ++i) test_correct += test_correct_array[i];
     float test_acc = static_cast<float>(test_correct) / test_samples;
 
+    auto testing_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> testing_time = testing_end - testing_start;
+    std::cout << "Testing Time: " << testing_time.count() << "s\n";
+
     std::cout << "Test Accuracy: " << test_acc << std::endl;
 
+    // Writing report
+    std::ofstream report("training_report.txt");
+    report << "Data Loading Time: " << data_load_time.count() << "s\n";
+    report << "Normalization Time: " << normalization_time.count() << "s\n";
+    report << "Training Time: " << training_time.count() << "s\n";
+    report << "Testing Time: " << testing_time.count() << "s\n";
+    report << "Test Accuracy: " << test_acc << std::endl;
+    report.close();
+
+    // Clean up memory
     cudaFree(loss_array);
     cudaFree(correct_array);
     cudaFree(test_correct_array);
