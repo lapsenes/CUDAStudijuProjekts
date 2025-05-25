@@ -1,3 +1,5 @@
+// cpu_main.cpp
+
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -16,7 +18,6 @@
 #define EPOCHS 600       // Number of training epochs
 #define LR 0.1f          // Learning rate
 #define TRAIN_RATIO 0.8f // 80% for training, 20% for testing
-#define SCALE_FACTOR 1.0f // Scaling factor for input features
 
 // Map from string class names to integer labels
 std::unordered_map<std::string, int> label_map = {
@@ -126,17 +127,10 @@ float compute_accuracy(float* probs, const std::vector<int>& labels, int rows) {
 }
 
 int main() {
-    // Timing the entire process
-    auto total_start = std::chrono::high_resolution_clock::now();
-
     // Load dataset
     std::vector<float> X, X_train, X_test;
     std::vector<int> y, y_train, y_test;
-    auto data_load_start = std::chrono::high_resolution_clock::now();
     if (!read_csv_data("iris.csv", X, y)) return 1;
-    auto data_load_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> data_load_time = data_load_end - data_load_start;
-    std::cout << "Data Loading Time: " << data_load_time.count() << "s\n";
 
     int total_samples = y.size();
     int train_samples = static_cast<int>(total_samples * TRAIN_RATIO);
@@ -166,8 +160,7 @@ int main() {
         y_test[i] = dataset[train_samples + i].second;
     }
 
-    // Normalize features using training mean and std, and apply scaling
-    auto norm_start = std::chrono::high_resolution_clock::now();
+    // Normalize features using training mean and std
     for (int j = 0; j < INPUT_DIM; ++j) {
         float sum = 0, sq_sum = 0;
         for (int i = 0; i < train_samples; ++i) {
@@ -178,13 +171,10 @@ int main() {
         float mean = sum / train_samples;
         float std = std::sqrt(sq_sum / train_samples - mean * mean + 1e-8f);
         for (int i = 0; i < train_samples; ++i)
-            X_train[i * INPUT_DIM + j] = (X_train[i * INPUT_DIM + j] - mean) / std * SCALE_FACTOR;
+            X_train[i * INPUT_DIM + j] = (X_train[i * INPUT_DIM + j] - mean) / std;
         for (int i = 0; i < test_samples; ++i)
-            X_test[i * INPUT_DIM + j] = (X_test[i * INPUT_DIM + j] - mean) / std * SCALE_FACTOR;
+            X_test[i * INPUT_DIM + j] = (X_test[i * INPUT_DIM + j] - mean) / std;
     }
-    auto norm_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> norm_time = norm_end - norm_start;
-    std::cout << "Normalization Time: " << norm_time.count() << "s\n";
 
     // Initialize weights and biases
     std::vector<float> W1(INPUT_DIM * HIDDEN_DIM), b1(HIDDEN_DIM, 0);
@@ -199,8 +189,7 @@ int main() {
     std::vector<float> logits(train_samples * OUTPUT_DIM);
     std::vector<float> probs(train_samples * OUTPUT_DIM);
 
-    // Training
-    auto training_start = std::chrono::high_resolution_clock::now();
+    auto start = std::chrono::high_resolution_clock::now(); // Start timing
 
     for (int epoch = 0; epoch < EPOCHS; ++epoch) {
         // Forward pass
@@ -251,9 +240,9 @@ int main() {
         }
     }
 
-    auto training_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> training_time = training_end - training_start;
-    std::cout << "Training Time: " << training_time.count() << "s" << std::endl;
+    auto end = std::chrono::high_resolution_clock::now(); // End timing
+    std::chrono::duration<double> elapsed = end - start;
+    std::cout << "\nCPU Training time: " << elapsed.count() << "s" << std::endl;
 
     // Evaluate on test set
     std::vector<float> hidden_test(test_samples * HIDDEN_DIM);
@@ -266,10 +255,6 @@ int main() {
     softmax(probs_test.data(), test_samples, OUTPUT_DIM);
     float test_acc = compute_accuracy(probs_test.data(), y_test, test_samples);
     std::cout << "Test Accuracy: " << test_acc << std::endl;
-
-    auto total_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> total_time = total_end - total_start;
-    std::cout << "Total Time: " << total_time.count() << "s" << std::endl;
 
     return 0;
 }
