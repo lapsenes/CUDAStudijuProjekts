@@ -1,4 +1,4 @@
-// main.cu
+// main.cu - GPU version of 2-layer neural network for Iris classification
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -6,11 +6,11 @@
 #include <string>
 #include <random>
 #include <unordered_map>
-#include <cuda_runtime.h>
 #include <cmath>
 #include <cstdlib>
 #include <algorithm>
 #include <chrono>
+#include <cuda_runtime.h>
 #include "dense_layer.h"
 
 #define INPUT_DIM 4
@@ -36,6 +36,7 @@ bool read_csv_data(const std::string& filename, std::vector<float>& X, std::vect
     std::ifstream file(filename);
     if (!file.is_open()) return false;
     std::string line;
+
     while (std::getline(file, line)) {
         std::stringstream ss(line);
         std::string val;
@@ -63,42 +64,6 @@ bool read_csv_data(const std::string& filename, std::vector<float>& X, std::vect
     return true;
 }
 
-float cross_entropy_loss(float* probs, int* labels, int batch_size, int num_classes) {
-    float loss = 0.0f;
-    const float epsilon = 1e-8f;
-    for (int i = 0; i < batch_size; ++i) {
-        int label = labels[i];
-        float p = probs[i * num_classes + label];
-        loss += -logf(p + epsilon);
-    }
-    return loss / batch_size;
-}
-
-float compute_loss_and_gradient(const float* probs, const int* labels, float* dY, int batch) {
-    for (int i = 0; i < batch; ++i) {
-        for (int j = 0; j < OUTPUT_DIM; ++j) {
-            dY[i * OUTPUT_DIM + j] = probs[i * OUTPUT_DIM + j] - (labels[i] == j ? 1.0f : 0.0f);
-        }
-    }
-    return cross_entropy_loss((float*)probs, (int*)labels, batch, OUTPUT_DIM);
-}
-
-float compute_accuracy(const float* preds, const int* labels, int batch) {
-    int correct = 0;
-    for (int i = 0; i < batch; ++i) {
-        int max_idx = 0;
-        float max_val = preds[i * OUTPUT_DIM];
-        for (int j = 1; j < OUTPUT_DIM; ++j) {
-            if (preds[i * OUTPUT_DIM + j] > max_val) {
-                max_val = preds[i * OUTPUT_DIM + j];
-                max_idx = j;
-            }
-        }
-        if (max_idx == labels[i]) ++correct;
-    }
-    return static_cast<float>(correct) / batch;
-}
-
 int main() {
     std::vector<float> full_X;
     std::vector<int> full_y;
@@ -117,7 +82,7 @@ int main() {
         dataset[i].second = full_y[i];
     }
 
-    std::srand(42);
+    std::srand(static_cast<unsigned>(time(nullptr)));
     for (int i = dataset.size() - 1; i > 0; --i) {
         int j = std::rand() % (i + 1);
         std::swap(dataset[i], dataset[j]);
@@ -160,7 +125,7 @@ int main() {
     cudaMallocManaged(&W2, HIDDEN_DIM * OUTPUT_DIM * sizeof(float));
     cudaMallocManaged(&b2, OUTPUT_DIM * sizeof(float));
 
-    std::mt19937 rng(42);
+    std::mt19937 rng(static_cast<unsigned>(time(nullptr)));
     std::uniform_real_distribution<float> dist(-0.1f, 0.1f);
     for (int i = 0; i < INPUT_DIM * HIDDEN_DIM; ++i) W1[i] = dist(rng);
     for (int i = 0; i < HIDDEN_DIM; ++i) b1[i] = 0.0f;
@@ -175,6 +140,14 @@ int main() {
     cudaMallocManaged(&dY, train_samples * OUTPUT_DIM * sizeof(float));
     std::copy(X_train.begin(), X_train.end(), X);
 
+    int* d_y_train;
+    cudaMallocManaged(&d_y_train, train_samples * sizeof(int));
+    std::copy(y_train.begin(), y_train.end(), d_y_train);
+
+    int* d_y_test;
+    cudaMallocManaged(&d_y_test, test_samples * sizeof(int));
+    std::copy(y_test.begin(), y_test.end(), d_y_test);
+
     float *dW1, *db1, *dW2, *db2;
     cudaMallocManaged(&dW1, INPUT_DIM * HIDDEN_DIM * sizeof(float));
     cudaMallocManaged(&db1, HIDDEN_DIM * sizeof(float));
@@ -184,6 +157,11 @@ int main() {
     float lambda = 1e-4f;
     float clip = 1.0f;
 
+    float* loss_array;
+    cudaMallocManaged(&loss_array, train_samples * sizeof(float));
+    int* correct_array;
+    cudaMallocManaged(&correct_array, train_samples * sizeof(int));
+
     auto start = std::chrono::high_resolution_clock::now();
     for (int epoch = 0; epoch < EPOCHS; ++epoch) {
         dense_forward(X, W1, b1, hidden, train_samples, INPUT_DIM, HIDDEN_DIM);
@@ -191,7 +169,12 @@ int main() {
         dense_forward(hidden, W2, b2, logits, train_samples, HIDDEN_DIM, OUTPUT_DIM);
         softmax_forward(logits, probs, train_samples, OUTPUT_DIM);
 
-        float loss = compute_loss_and_gradient(probs, y_train.data(), dY, train_samples);
+        compute_loss_and_gradient_cuda(probs, d_y_train, dY, loss_array, train_samples, OUTPUT_DIM);
+
+        float loss = 0.0f;
+        for (int i = 0; i < train_samples; ++i) loss += loss_array[i];
+        loss /= train_samples;
+
         dense_backward(dY, hidden, dW2, db2, train_samples, HIDDEN_DIM, OUTPUT_DIM);
         dense_backward(dY, X, dW1, db1, train_samples, INPUT_DIM, HIDDEN_DIM);
 
@@ -201,7 +184,10 @@ int main() {
         for (int i = 0; i < OUTPUT_DIM; ++i) b2[i] -= LR * fminf(fmaxf(db2[i], -clip), clip);
 
         if (epoch % 100 == 0 || epoch == EPOCHS - 1) {
-            float acc = compute_accuracy(probs, y_train.data(), train_samples);
+            compute_accuracy_cuda(probs, d_y_train, correct_array, train_samples, OUTPUT_DIM);
+            int correct = 0;
+            for (int i = 0; i < train_samples; ++i) correct += correct_array[i];
+            float acc = static_cast<float>(correct) / train_samples;
             std::cout << "Epoch " << epoch << " - Loss: " << loss << ", Accuracy: " << acc << std::endl;
         }
     }
@@ -219,8 +205,22 @@ int main() {
     relu_forward(Htest, test_samples * HIDDEN_DIM);
     dense_forward(Htest, W2, b2, Ltest, test_samples, HIDDEN_DIM, OUTPUT_DIM);
     softmax_forward(Ltest, SoftTest, test_samples, OUTPUT_DIM);
-    float test_acc = compute_accuracy(SoftTest, y_test.data(), test_samples);
+
+    int* test_correct_array;
+    cudaMallocManaged(&test_correct_array, test_samples * sizeof(int));
+    compute_accuracy_cuda(SoftTest, d_y_test, test_correct_array, test_samples, OUTPUT_DIM);
+
+    int test_correct = 0;
+    for (int i = 0; i < test_samples; ++i) test_correct += test_correct_array[i];
+    float test_acc = static_cast<float>(test_correct) / test_samples;
+
     std::cout << "Test Accuracy: " << test_acc << std::endl;
+
+    cudaFree(loss_array);
+    cudaFree(correct_array);
+    cudaFree(test_correct_array);
+    cudaFree(d_y_train);
+    cudaFree(d_y_test);
 
     return 0;
 }
