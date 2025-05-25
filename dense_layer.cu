@@ -1,10 +1,19 @@
 #include <cuda_runtime.h>
-#include "dense_layer.h"
+#include <iostream>
+#include <cmath>
 
-// Matrix multiplication kernel with bias addition for a dense layer
+// Leaky ReLU activation kernel (with a small negative slope alpha)
+__global__ void leaky_relu_kernel(float* A, int total, float alpha) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        A[idx] = (A[idx] > 0.0f) ? A[idx] : alpha * A[idx];
+    }
+}
+
+// Forward pass kernel for dense layer
 __global__ void forward_kernel(float* X, float* W, float* b, float* Y, int batch, int in_size, int out_size) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y; // sample index
-    int col = blockIdx.x * blockDim.x + threadIdx.x; // output neuron index
+    int row = blockIdx.y * blockDim.y + threadIdx.y; 
+    int col = blockIdx.x * blockDim.x + threadIdx.x; 
 
     if (row < batch && col < out_size) {
         float sum = 0.0f;
@@ -15,38 +24,18 @@ __global__ void forward_kernel(float* X, float* W, float* b, float* Y, int batch
     }
 }
 
-// ReLU activation kernel
-__global__ void relu_kernel(float* A, int total) {
+// Leaky ReLU backward kernel
+__global__ void leaky_relu_backward_kernel(float* dY, float* hidden, int total, float alpha) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < total) {
-        A[idx] = fmaxf(0.0f, A[idx]);
+        if (hidden[idx] <= 0.0f) {
+            dY[idx] *= alpha;  // If input <= 0, scale the gradient by alpha
+        }
     }
 }
 
-// Softmax kernel, operates per row (sample)
-__global__ void softmax_kernel(float* input, float* output, int batch, int dim) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x; // row index
-    if (i >= batch) return;
-
-    // Find max for numerical stability
-    float max_val = input[i * dim];
-    for (int j = 1; j < dim; ++j) {
-        max_val = fmaxf(max_val, input[i * dim + j]);
-    }
-
-    // Compute softmax
-    float sum_exp = 0.0f;
-    for (int j = 0; j < dim; ++j) {
-        output[i * dim + j] = expf(input[i * dim + j] - max_val);
-        sum_exp += output[i * dim + j];
-    }
-    for (int j = 0; j < dim; ++j) {
-        output[i * dim + j] /= sum_exp;
-    }
-}
-
-// Backpropagation for dense layer (computes dW and db)
-__global__ void backward_kernel(float* dY, float* X, float* dW, float* db, int batch, int in_size, int out_size) {
+// Backward pass kernel for dense layer (computing dW and db)
+__global__ void backward_kernel(float* dY, float* X, float* dW, float* db, int batch, int in_size, int out_size, bool use_leaky_relu = false, float alpha = 0.01f) {
     int i = blockIdx.y * blockDim.y + threadIdx.y;  // input feature index
     int j = blockIdx.x * blockDim.x + threadIdx.x;  // output neuron index
 
@@ -58,7 +47,6 @@ __global__ void backward_kernel(float* dY, float* X, float* dW, float* db, int b
         dW[i * out_size + j] = grad / batch;
     }
 
-    // Compute db for each output neuron (only once per output neuron)
     if (i == 0 && j < out_size) {
         float bias_grad = 0.0f;
         for (int n = 0; n < batch; ++n) {
@@ -66,16 +54,43 @@ __global__ void backward_kernel(float* dY, float* X, float* dW, float* db, int b
         }
         db[j] = bias_grad / batch;
     }
+
+    // If using Leaky ReLU, adjust the gradient calculation
+    if (use_leaky_relu && i < in_size && j < out_size) {
+        // Leaky ReLU gradient adjustment: if the input was <= 0, multiply the gradient by alpha
+        if (X[i] <= 0.0f) {
+            dY[i] *= alpha;  // Adjust the gradient for the dead neurons (Leaky ReLU)
+        }
+    }
 }
 
+// Softmax kernel (used after the output layer)
+__global__ void softmax_kernel(float* input, float* output, int batch, int dim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x; 
+    if (i >= batch) return;
 
+    float max_val = input[i * dim];
+    for (int j = 1; j < dim; ++j) {
+        max_val = fmaxf(max_val, input[i * dim + j]);
+    }
 
+    float sum_exp = 0.0f;
+    for (int j = 0; j < dim; ++j) {
+        output[i * dim + j] = expf(input[i * dim + j] - max_val);
+        sum_exp += output[i * dim + j];
+    }
+    for (int j = 0; j < dim; ++j) {
+        output[i * dim + j] /= sum_exp;
+    }
+}
+
+// Loss gradient kernel for cross-entropy loss and backpropagation
 __global__ void loss_gradient_kernel(const float* probs, const int* labels, float* dY, float* loss, int batch, int classes) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= batch) return;
 
     int label = labels[i];
-    float sample_loss = -logf(probs[i * classes + label] + 1e-8f); // avoid log(0)
+    float sample_loss = -logf(probs[i * classes + label] + 1e-8f); // Log with small epsilon for numerical stability
     loss[i] = sample_loss;
 
     for (int j = 0; j < classes; ++j) {
@@ -83,6 +98,7 @@ __global__ void loss_gradient_kernel(const float* probs, const int* labels, floa
     }
 }
 
+// Accuracy kernel
 __global__ void accuracy_kernel(const float* probs, const int* labels, int* correct, int batch, int classes) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= batch) return;
@@ -99,9 +115,7 @@ __global__ void accuracy_kernel(const float* probs, const int* labels, int* corr
     correct[i] = (max_idx == labels[i]) ? 1 : 0;
 }
 
-
-
-// Launches forward kernel
+// Forward pass function for dense layer
 void dense_forward(float* X, float* W, float* b, float* Y, int batch, int in_size, int out_size) {
     dim3 block(16, 16);
     dim3 grid((out_size + 15) / 16, (batch + 15) / 16);
@@ -109,23 +123,23 @@ void dense_forward(float* X, float* W, float* b, float* Y, int batch, int in_siz
     cudaDeviceSynchronize();
 }
 
-// Launches backward kernel
-void dense_backward(float* dY, float* X, float* dW, float* db, int batch, int in_size, int out_size) {
+// Backward pass function for dense layer
+void dense_backward(float* dY, float* X, float* dW, float* db, int batch, int in_size, int out_size, bool use_leaky_relu = false, float alpha = 0.01f) {
     dim3 block(16, 16);
     dim3 grid((out_size + 15) / 16, (in_size + 15) / 16);
-    backward_kernel<<<grid, block>>>(dY, X, dW, db, batch, in_size, out_size);
+    backward_kernel<<<grid, block>>>(dY, X, dW, db, batch, in_size, out_size, use_leaky_relu, alpha);
     cudaDeviceSynchronize();
 }
 
-// Launches ReLU activation kernel
-void relu_forward(float* A, int total) {
+// Leaky ReLU forward function
+void leaky_relu_forward(float* A, int total, float alpha = 0.01f) {
     int blockSize = 256;
     int gridSize = (total + blockSize - 1) / blockSize;
-    relu_kernel<<<gridSize, blockSize>>>(A, total);
+    leaky_relu_kernel<<<gridSize, blockSize>>>(A, total, alpha);
     cudaDeviceSynchronize();
 }
 
-// Launches softmax kernel
+// Softmax forward function
 void softmax_forward(float* input, float* output, int batch, int dim) {
     int blockSize = 256;
     int gridSize = (batch + blockSize - 1) / blockSize;
@@ -133,6 +147,7 @@ void softmax_forward(float* input, float* output, int batch, int dim) {
     cudaDeviceSynchronize();
 }
 
+// Loss and gradient computation function
 void compute_loss_and_gradient_cuda(const float* probs, const int* labels, float* dY, float* loss_array, int batch, int classes) {
     int blockSize = 256;
     int gridSize = (batch + blockSize - 1) / blockSize;
@@ -140,9 +155,18 @@ void compute_loss_and_gradient_cuda(const float* probs, const int* labels, float
     cudaDeviceSynchronize();
 }
 
+// Accuracy computation function
 void compute_accuracy_cuda(const float* probs, const int* labels, int* correct_array, int batch, int classes) {
     int blockSize = 256;
     int gridSize = (batch + blockSize - 1) / blockSize;
     accuracy_kernel<<<gridSize, blockSize>>>(probs, labels, correct_array, batch, classes);
+    cudaDeviceSynchronize();
+}
+
+// Leaky ReLU backward function
+void leaky_relu_backward(float* dY, float* hidden, int total, float alpha = 0.01f) {
+    int blockSize = 256;
+    int gridSize = (total + blockSize - 1) / blockSize;
+    leaky_relu_backward_kernel<<<gridSize, blockSize>>>(dY, hidden, total, alpha);
     cudaDeviceSynchronize();
 }

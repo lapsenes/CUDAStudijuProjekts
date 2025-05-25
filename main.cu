@@ -1,245 +1,299 @@
-// main.cu - GPU version of 2-layer neural network for Iris classification
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <vector>
 #include <string>
 #include <random>
-#include <unordered_map>
 #include <cmath>
-#include <cstdlib>
-#include <algorithm>
 #include <chrono>
+#include <ctime>
 #include <cuda_runtime.h>
 #include "dense_layer.h"
 
-#define INPUT_DIM 4
-#define HIDDEN_DIM 6
-#define OUTPUT_DIM 3
-#define EPOCHS 600
-#define LR 0.1f
+#define INPUT_DIM   784    // 28x28 images for MNIST
+#define HIDDEN_DIM  128
+#define OUTPUT_DIM  10
+#define EPOCHS      200
+#define LR          0.0001f
 #define TRAIN_RATIO 0.8f
+#define CLIP_VALUE  5.0f
+#define LAMBDA      1e-4f
 
-// value mapping for labels
-std::unordered_map<std::string, int> label_map = {
-    {"Iris-setosa", 0},
-    {"Iris-versicolor", 1},
-    {"Iris-virginica", 2}
-};
+// Helper macro for CUDA error checking
+#define CUDA_CHECK(call)                                                       \
+  do {                                                                         \
+    cudaError_t err = call;                                                    \
+    if (err != cudaSuccess) {                                                  \
+      std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__             \
+                << " '" #call "' failed: " << cudaGetErrorString(err) << "\n"; \
+      exit(1);                                                                 \
+    }                                                                          \
+  } while (0)
 
-
-
-std::string trim(const std::string& s) {
-    size_t start = s.find_first_not_of(" \t\r\n");
-    size_t end = s.find_last_not_of(" \t\r\n");
-    return (start == std::string::npos) ? "" : s.substr(start, end - start + 1);
-}
-
-bool read_csv_data(const std::string& filename, std::vector<float>& X, std::vector<int>& y) { // reads in all feature columns and labels (which get encoded based on label_map)
+  bool read_mnist_csv(const std::string& filename, std::vector<float>& X, std::vector<int>& y) {
     std::ifstream file(filename);
     if (!file.is_open()) return false;
     std::string line;
 
+    // Skip the header line once
+    if (!std::getline(file, line)) 
+        return false;
+
     while (std::getline(file, line)) {
+        if (line.empty()) continue;                // skip blank lines
         std::stringstream ss(line);
         std::string val;
         int col = 0;
-        std::vector<float> sample(INPUT_DIM); // size is tied to the set input dimension (col count)
-        std::string label;
+        std::vector<float> sample(INPUT_DIM);
+        int label = 0;
+
         while (std::getline(ss, val, ',')) {
-            val = trim(val);
             if (col < INPUT_DIM) {
                 try {
-                    sample[col] = std::stof(val);
+                    sample[col] = std::stof(val) / 255.0f;
                 } catch (...) {
-                    sample[col] = 0;
+                    sample[col] = 0.0f;
                 }
-            } else {
-                label = val; // if the column is the label one
+            } else if (col == INPUT_DIM) {
+                try {
+                    label = std::stoi(val);
+                } catch (...) {
+                    label = 0;
+                }
             }
-            col++;
+            ++col;
         }
-        if (col == INPUT_DIM + 1 && label_map.count(label)) { // label gets encoded
+
+        // Only accept rows with at least INPUT_DIM+1 columns
+        if (col >= INPUT_DIM + 1) {
             X.insert(X.end(), sample.begin(), sample.end());
-            y.push_back(label_map[label]);
+            y.push_back(label);
         }
     }
     return true;
 }
 
 
+void test_model(float* X_test, float* W1, float* b1, float* W2, float* b2,
+                int* y_test, int test_samples,
+                int input_dim, int hidden_dim, int output_dim) {
+    float *hidden, *logits, *probs;
+    CUDA_CHECK(cudaMallocManaged(&hidden, test_samples * hidden_dim * sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&logits, test_samples * output_dim * sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&probs, test_samples * output_dim * sizeof(float)));
 
+    // Forward pass
+    dense_forward(X_test, W1, b1, hidden, test_samples, input_dim, hidden_dim);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    leaky_relu_forward(hidden, test_samples * hidden_dim);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    dense_forward(hidden, W2, b2, logits, test_samples, hidden_dim, output_dim);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    softmax_forward(logits, probs, test_samples, output_dim);
+    CUDA_CHECK(cudaDeviceSynchronize());
 
+    // Accuracy
+    int* correct_array;
+    CUDA_CHECK(cudaMallocManaged(&correct_array, test_samples * sizeof(int)));
+    compute_accuracy_cuda(probs, y_test, correct_array, test_samples, output_dim);
+    CUDA_CHECK(cudaDeviceSynchronize());
 
-// main
+    int correct = 0;
+    for (int i = 0; i < test_samples; ++i) correct += correct_array[i];
+    std::cout << "Test Accuracy: " << (float)correct / test_samples << std::endl;
 
-
+    // Clean up
+    cudaFree(hidden);
+    cudaFree(logits);
+    cudaFree(probs);
+    cudaFree(correct_array);
+}
 
 int main() {
     std::vector<float> full_X;
-    std::vector<int> full_y;
-    if (!read_csv_data("iris.csv", full_X, full_y)) { // load the specific dataset
-        std::cerr << "Failed to load iris.csv\n";
+    std::vector<int>   full_y;
+    if (!read_mnist_csv("mnist.csv", full_X, full_y)) {
+        std::cerr << "Failed to load mnist.csv\n";
         return 1;
     }
 
     int total_samples = full_y.size();
-    int train_samples = static_cast<int>(total_samples * TRAIN_RATIO);
-    int test_samples = total_samples - train_samples;
+    int train_samples = int(total_samples * TRAIN_RATIO);
+    int test_samples  = total_samples - train_samples;
 
-    std::vector<std::pair<std::vector<float>, int>> dataset(total_samples); // dataset of pairs (floats + int) of size total_samples
+    // Build dataset
+    std::vector<std::pair<std::vector<float>,int>> dataset(total_samples);
     for (int i = 0; i < total_samples; ++i) {
-        dataset[i].first = std::vector<float>(full_X.begin() + i * INPUT_DIM, full_X.begin() + (i + 1) * INPUT_DIM); // feature vector
-        dataset[i].second = full_y[i]; // encoded class
+        dataset[i].first.assign(
+            full_X.begin() + i*INPUT_DIM,
+            full_X.begin() + (i+1)*INPUT_DIM
+        );
+        dataset[i].second = full_y[i];
     }
 
-    std::srand(static_cast<unsigned>(time(nullptr))); // enable random shuffle, not seeded
-
-    // dataset is ordered, needs to be shuffled
-    for (int i = dataset.size() - 1; i > 0; --i) { // fisher-yates shuffle algorithm
+    // Manual Fisher–Yates shuffle
+    std::srand(static_cast<unsigned>(time(nullptr)));
+    for (int i = total_samples - 1; i > 0; --i) {
         int j = std::rand() % (i + 1);
         std::swap(dataset[i], dataset[j]);
     }
 
-    // flat array init for storing train and test data 
-    std::vector<float> X_train(train_samples * INPUT_DIM); // to accomodate for all features
-    std::vector<int> y_train(train_samples);
-    std::vector<float> X_test(test_samples * INPUT_DIM);
-    std::vector<int> y_test(test_samples);
-
-    // populating training data from the read-in dataset 
-    for (int i = 0; i < train_samples; ++i) { // for each sample
-        for (int j = 0; j < INPUT_DIM; ++j) // for each column
-            X_train[i * INPUT_DIM + j] = dataset[i].first[j];
+    // Split X/y
+    std::vector<float> X_train(train_samples*INPUT_DIM), X_test_vec(test_samples*INPUT_DIM);
+    std::vector<int>   y_train(train_samples),       y_test(test_samples);
+    for (int i = 0; i < train_samples; ++i) {
+        std::copy(dataset[i].first.begin(), dataset[i].first.end(),
+                  X_train.begin() + i*INPUT_DIM);
         y_train[i] = dataset[i].second;
     }
-
-    // populating testing data from the read-in dataset 
     for (int i = 0; i < test_samples; ++i) {
-        for (int j = 0; j < INPUT_DIM; ++j)
-            X_test[i * INPUT_DIM + j] = dataset[train_samples + i].first[j];
-        y_test[i] = dataset[train_samples + i].second;
+        std::copy(dataset[train_samples+i].first.begin(),
+                  dataset[train_samples+i].first.end(),
+                  X_test_vec.begin() + i*INPUT_DIM);
+        y_test[i] = dataset[train_samples+i].second;
     }
 
-
-    for (int j = 0; j < INPUT_DIM; ++j) { // for each column
-        float sum = 0, sum_sq = 0;
-        for (int i = 0; i < train_samples; ++i) { // for each sample
-            float val = X_train[i * INPUT_DIM + j]; // because of the 1D array
-            sum += val; 
-            sum_sq += val * val;
+    // Normalize
+    for (int j = 0; j < INPUT_DIM; ++j) {
+        double sum = 0, sum_sq = 0;
+        for (int i = 0; i < train_samples; ++i) {
+            float v = X_train[i*INPUT_DIM + j];
+            sum += v; sum_sq += v*v;
         }
         float mean = sum / train_samples;
-        float std = std::sqrt(sum_sq / train_samples - mean * mean + 1e-8f);
-        // normalizing both training and test data using only training
+        float stdv = std::sqrt(sum_sq / train_samples - mean*mean + 1e-8f);
         for (int i = 0; i < train_samples; ++i)
-            X_train[i * INPUT_DIM + j] = (X_train[i * INPUT_DIM + j] - mean) / std;
+            X_train[i*INPUT_DIM + j] = (X_train[i*INPUT_DIM + j] - mean) / stdv;
         for (int i = 0; i < test_samples; ++i)
-            X_test[i * INPUT_DIM + j] = (X_test[i * INPUT_DIM + j] - mean) / std;
+            X_test_vec[i*INPUT_DIM + j] = (X_test_vec[i*INPUT_DIM + j] - mean) / stdv;
     }
 
+    // Allocate model parameters
     float *W1, *b1, *W2, *b2;
-    cudaMallocManaged(&W1, INPUT_DIM * HIDDEN_DIM * sizeof(float));
-    cudaMallocManaged(&b1, HIDDEN_DIM * sizeof(float));
-    cudaMallocManaged(&W2, HIDDEN_DIM * OUTPUT_DIM * sizeof(float));
-    cudaMallocManaged(&b2, OUTPUT_DIM * sizeof(float));
+    CUDA_CHECK(cudaMallocManaged(&W1, INPUT_DIM*HIDDEN_DIM*sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&b1, HIDDEN_DIM*sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&W2, HIDDEN_DIM*OUTPUT_DIM*sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&b2, OUTPUT_DIM*sizeof(float)));
 
-    std::mt19937 rng(static_cast<unsigned>(time(nullptr)));
-    std::uniform_real_distribution<float> dist(-0.1f, 0.1f);
-    for (int i = 0; i < INPUT_DIM * HIDDEN_DIM; ++i) W1[i] = dist(rng);
-    for (int i = 0; i < HIDDEN_DIM; ++i) b1[i] = 0.0f;
-    for (int i = 0; i < HIDDEN_DIM * OUTPUT_DIM; ++i) W2[i] = dist(rng);
-    for (int i = 0; i < OUTPUT_DIM; ++i) b2[i] = 0.0f;
+    // He initialization
+    std::mt19937 rng{std::random_device{}()};
+    std::uniform_real_distribution<float> dist(-0.1f,0.1f);
+    float scale = std::sqrt(2.0f/INPUT_DIM);
+    for (int i = 0; i < INPUT_DIM*HIDDEN_DIM; ++i) W1[i] = dist(rng)*scale;
+    for (int i = 0; i < HIDDEN_DIM; ++i) b1[i] = 0;
+    for (int i = 0; i < HIDDEN_DIM*OUTPUT_DIM; ++i) W2[i] = dist(rng)*scale;
+    for (int i = 0; i < OUTPUT_DIM; ++i) b2[i] = 0;
 
+    // Allocate training buffers
     float *X, *hidden, *logits, *probs, *dY;
-    cudaMallocManaged(&X, train_samples * INPUT_DIM * sizeof(float));
-    cudaMallocManaged(&hidden, train_samples * HIDDEN_DIM * sizeof(float));
-    cudaMallocManaged(&logits, train_samples * OUTPUT_DIM * sizeof(float));
-    cudaMallocManaged(&probs, train_samples * OUTPUT_DIM * sizeof(float));
-    cudaMallocManaged(&dY, train_samples * OUTPUT_DIM * sizeof(float));
-    std::copy(X_train.begin(), X_train.end(), X);
+    int   *d_y_train;
+    CUDA_CHECK(cudaMallocManaged(&X,      train_samples*INPUT_DIM*sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&hidden, train_samples*HIDDEN_DIM*sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&logits, train_samples*OUTPUT_DIM*sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&probs,  train_samples*OUTPUT_DIM*sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&dY,     train_samples*OUTPUT_DIM*sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&d_y_train, train_samples*sizeof(int)));
 
-    int* d_y_train;
-    cudaMallocManaged(&d_y_train, train_samples * sizeof(int));
+    std::copy(X_train.begin(), X_train.end(), X);
     std::copy(y_train.begin(), y_train.end(), d_y_train);
 
-    int* d_y_test;
-    cudaMallocManaged(&d_y_test, test_samples * sizeof(int));
-    std::copy(y_test.begin(), y_test.end(), d_y_test);
+    // Gradients & loss arrays
+    float *dW1, *db1, *dW2, *db2, *loss_array;
+    int   *correct_array;
+    CUDA_CHECK(cudaMallocManaged(&dW1,       INPUT_DIM*HIDDEN_DIM*sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&db1,       HIDDEN_DIM*sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&dW2,       HIDDEN_DIM*OUTPUT_DIM*sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&db2,       OUTPUT_DIM*sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&loss_array,train_samples*sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&correct_array, train_samples*sizeof(int)));
 
-    float *dW1, *db1, *dW2, *db2;
-    cudaMallocManaged(&dW1, INPUT_DIM * HIDDEN_DIM * sizeof(float));
-    cudaMallocManaged(&db1, HIDDEN_DIM * sizeof(float));
-    cudaMallocManaged(&dW2, HIDDEN_DIM * OUTPUT_DIM * sizeof(float));
-    cudaMallocManaged(&db2, OUTPUT_DIM * sizeof(float));
+    auto t0 = std::chrono::high_resolution_clock::now();
 
-    float lambda = 1e-4f;
-    float clip = 1.0f;
-
-    float* loss_array;
-    cudaMallocManaged(&loss_array, train_samples * sizeof(float));
-    int* correct_array;
-    cudaMallocManaged(&correct_array, train_samples * sizeof(int));
-
-    auto start = std::chrono::high_resolution_clock::now();
     for (int epoch = 0; epoch < EPOCHS; ++epoch) {
-        dense_forward(X, W1, b1, hidden, train_samples, INPUT_DIM, HIDDEN_DIM);
-        relu_forward(hidden, train_samples * HIDDEN_DIM);
+        // Forward
+        dense_forward(X,  W1, b1, hidden, train_samples, INPUT_DIM, HIDDEN_DIM);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        leaky_relu_forward(hidden, train_samples*HIDDEN_DIM);
+        CUDA_CHECK(cudaDeviceSynchronize());
         dense_forward(hidden, W2, b2, logits, train_samples, HIDDEN_DIM, OUTPUT_DIM);
+        CUDA_CHECK(cudaDeviceSynchronize());
         softmax_forward(logits, probs, train_samples, OUTPUT_DIM);
+        CUDA_CHECK(cudaDeviceSynchronize());
 
+        // Loss & gradient
         compute_loss_and_gradient_cuda(probs, d_y_train, dY, loss_array, train_samples, OUTPUT_DIM);
+        CUDA_CHECK(cudaDeviceSynchronize());
 
-        float loss = 0.0f;
+        // Compute epoch loss
+        double loss = 0;
         for (int i = 0; i < train_samples; ++i) loss += loss_array[i];
         loss /= train_samples;
 
-        dense_backward(dY, hidden, dW2, db2, train_samples, HIDDEN_DIM, OUTPUT_DIM);
-        dense_backward(dY, X, dW1, db1, train_samples, INPUT_DIM, HIDDEN_DIM);
+        // Backprop second layer
+        dense_backward(dY, hidden, dW2, db2, train_samples, HIDDEN_DIM, OUTPUT_DIM, true);
+        CUDA_CHECK(cudaDeviceSynchronize());
 
-        for (int i = 0; i < INPUT_DIM * HIDDEN_DIM; ++i) W1[i] -= LR * (fminf(fmaxf(dW1[i], -clip), clip) + lambda * W1[i]);
-        for (int i = 0; i < HIDDEN_DIM; ++i) b1[i] -= LR * fminf(fmaxf(db1[i], -clip), clip);
-        for (int i = 0; i < HIDDEN_DIM * OUTPUT_DIM; ++i) W2[i] -= LR * (fminf(fmaxf(dW2[i], -clip), clip) + lambda * W2[i]);
-        for (int i = 0; i < OUTPUT_DIM; ++i) b2[i] -= LR * fminf(fmaxf(db2[i], -clip), clip);
+        // Hidden grad on CPU + Leaky back
+        float* dY_hidden;
+        CUDA_CHECK(cudaMallocManaged(&dY_hidden, train_samples*HIDDEN_DIM*sizeof(float)));
+        for (int i = 0; i < train_samples; ++i)
+          for (int j = 0; j < HIDDEN_DIM; ++j) {
+            float sum = 0;
+            for (int k = 0; k < OUTPUT_DIM; ++k)
+              sum += dY[i*OUTPUT_DIM + k]*W2[j*OUTPUT_DIM + k];
+            dY_hidden[i*HIDDEN_DIM + j] = sum;
+          }
+        leaky_relu_backward(dY_hidden, hidden, train_samples*HIDDEN_DIM, 0.01f);
+        CUDA_CHECK(cudaDeviceSynchronize());
 
-        if (epoch % 100 == 0 || epoch == EPOCHS - 1) {
-            compute_accuracy_cuda(probs, d_y_train, correct_array, train_samples, OUTPUT_DIM);
-            int correct = 0;
-            for (int i = 0; i < train_samples; ++i) correct += correct_array[i];
-            float acc = static_cast<float>(correct) / train_samples;
-            std::cout << "Epoch " << epoch << " - Loss: " << loss << ", Accuracy: " << acc << std::endl;
+        // Backprop first layer
+        dense_backward(dY_hidden, X, dW1, db1, train_samples, INPUT_DIM, HIDDEN_DIM, true);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        cudaFree(dY_hidden);
+
+        // Update weights
+        for (int i = 0; i < INPUT_DIM*HIDDEN_DIM; ++i)
+          W1[i] -= LR*(fminf(fmaxf(dW1[i], -CLIP_VALUE), CLIP_VALUE) + LAMBDA*W1[i]);
+        for (int i = 0; i < HIDDEN_DIM; ++i)
+          b1[i] -= LR*fminf(fmaxf(db1[i], -CLIP_VALUE), CLIP_VALUE);
+        for (int i = 0; i < HIDDEN_DIM*OUTPUT_DIM; ++i)
+          W2[i] -= LR*(fminf(fmaxf(dW2[i], -CLIP_VALUE), CLIP_VALUE) + LAMBDA*W2[i]);
+        for (int i = 0; i < OUTPUT_DIM; ++i)
+          b2[i] -= LR*fminf(fmaxf(db2[i], -CLIP_VALUE), CLIP_VALUE);
+
+        if (epoch % 100 == 0 || epoch == EPOCHS-1) {
+          compute_accuracy_cuda(probs, d_y_train, correct_array, train_samples, OUTPUT_DIM);
+          CUDA_CHECK(cudaDeviceSynchronize());
+          int correct = 0;
+          for (int i = 0; i < train_samples; ++i) correct += correct_array[i];
+          std::cout << "Epoch " << epoch
+                    << " - Loss: " << loss
+                    << ", Accuracy: " << double(correct)/train_samples
+                    << "\n";
         }
     }
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = end - start;
-    std::cout << "\nGPU Training time: " << elapsed.count() << "s" << std::endl;
 
-    float* Xtest_dev, *Htest, *Ltest, *SoftTest;
-    cudaMallocManaged(&Xtest_dev, test_samples * INPUT_DIM * sizeof(float));
-    cudaMallocManaged(&Htest, test_samples * HIDDEN_DIM * sizeof(float));
-    cudaMallocManaged(&Ltest, test_samples * OUTPUT_DIM * sizeof(float));
-    cudaMallocManaged(&SoftTest, test_samples * OUTPUT_DIM * sizeof(float));
-    std::copy(X_test.begin(), X_test.end(), Xtest_dev);
-    dense_forward(Xtest_dev, W1, b1, Htest, test_samples, INPUT_DIM, HIDDEN_DIM);
-    relu_forward(Htest, test_samples * HIDDEN_DIM);
-    dense_forward(Htest, W2, b2, Ltest, test_samples, HIDDEN_DIM, OUTPUT_DIM);
-    softmax_forward(Ltest, SoftTest, test_samples, OUTPUT_DIM);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    std::cout << "Training Time: "
+              << std::chrono::duration<double>(t1-t0).count() << "s\n";
 
-    int* test_correct_array;
-    cudaMallocManaged(&test_correct_array, test_samples * sizeof(int));
-    compute_accuracy_cuda(SoftTest, d_y_test, test_correct_array, test_samples, OUTPUT_DIM);
+    // Test
+    float* X_test_dev;  int* y_test_dev;
+    CUDA_CHECK(cudaMallocManaged(&X_test_dev, test_samples*INPUT_DIM*sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&y_test_dev, test_samples*sizeof(int)));
+    std::copy(X_test_vec.begin(), X_test_vec.end(), X_test_dev);
+    std::copy(y_test.begin(),    y_test.end(),    y_test_dev);
 
-    int test_correct = 0;
-    for (int i = 0; i < test_samples; ++i) test_correct += test_correct_array[i];
-    float test_acc = static_cast<float>(test_correct) / test_samples;
+    test_model(X_test_dev, W1, b1, W2, b2, y_test_dev,
+               test_samples, INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM);
 
-    std::cout << "Test Accuracy: " << test_acc << std::endl;
-
-    cudaFree(loss_array);
-    cudaFree(correct_array);
-    cudaFree(test_correct_array);
-    cudaFree(d_y_train);
-    cudaFree(d_y_test);
+    // Cleanup
+    cudaFree(X_test_dev); cudaFree(y_test_dev);
+    cudaFree(X); cudaFree(hidden); cudaFree(logits); cudaFree(probs);
+    cudaFree(dY); cudaFree(d_y_train);
+    cudaFree(dW1); cudaFree(db1); cudaFree(dW2); cudaFree(db2);
+    cudaFree(loss_array); cudaFree(correct_array);
+    cudaFree(W1); cudaFree(b1); cudaFree(W2); cudaFree(b2);
 
     return 0;
 }
