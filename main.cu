@@ -13,8 +13,8 @@
 #define INPUT_DIM   784    // 28x28 images for MNIST
 #define HIDDEN_DIM  128
 #define OUTPUT_DIM  10
-#define EPOCHS      100
-#define LR          0.0001f
+#define EPOCHS      10
+#define LR          0.01f
 #define TRAIN_RATIO 0.8f
 #define CLIP_VALUE  5.0f
 #define LAMBDA      1e-4f
