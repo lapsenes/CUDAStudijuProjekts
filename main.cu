@@ -13,7 +13,7 @@
 #define INPUT_DIM   784    // 28x28 images for MNIST
 #define HIDDEN_DIM  128
 #define OUTPUT_DIM  10
-#define EPOCHS      10
+#define EPOCHS      1000
 #define LR          0.01f
 #define TRAIN_RATIO 0.8f
 #define CLIP_VALUE  5.0f
@@ -85,13 +85,9 @@ void test_model(float* X_test, float* W1, float* b1, float* W2, float* b2,
 
     // Forward pass
     dense_forward(X_test, W1, b1, hidden, test_samples, input_dim, hidden_dim);
-    CUDA_CHECK(cudaDeviceSynchronize());
     leaky_relu_forward(hidden, test_samples * hidden_dim);
-    CUDA_CHECK(cudaDeviceSynchronize());
     dense_forward(hidden, W2, b2, logits, test_samples, hidden_dim, output_dim);
-    CUDA_CHECK(cudaDeviceSynchronize());
     softmax_forward(logits, probs, test_samples, output_dim);
-    CUDA_CHECK(cudaDeviceSynchronize());
 
     // Accuracy
     int* correct_array;
@@ -215,13 +211,9 @@ int main() {
     for (int epoch = 0; epoch < EPOCHS; ++epoch) {
         // Forward
         dense_forward(X,  W1, b1, hidden, train_samples, INPUT_DIM, HIDDEN_DIM);
-        CUDA_CHECK(cudaDeviceSynchronize());
         leaky_relu_forward(hidden, train_samples*HIDDEN_DIM);
-        CUDA_CHECK(cudaDeviceSynchronize());
         dense_forward(hidden, W2, b2, logits, train_samples, HIDDEN_DIM, OUTPUT_DIM);
-        CUDA_CHECK(cudaDeviceSynchronize());
         softmax_forward(logits, probs, train_samples, OUTPUT_DIM);
-        CUDA_CHECK(cudaDeviceSynchronize());
 
         // Loss & gradient
         compute_loss_and_gradient_cuda(probs, d_y_train, dY, loss_array, train_samples, OUTPUT_DIM);
@@ -234,23 +226,14 @@ int main() {
 
         // Backprop second layer
         dense_backward(dY, hidden, dW2, db2, train_samples, HIDDEN_DIM, OUTPUT_DIM, true);
-        CUDA_CHECK(cudaDeviceSynchronize());
 
         // Hidden grad on CPU + Leaky back
         float* dY_hidden;
         CUDA_CHECK(cudaMallocManaged(&dY_hidden, train_samples*HIDDEN_DIM*sizeof(float)));
-        for (int i = 0; i < train_samples; ++i)
-          for (int j = 0; j < HIDDEN_DIM; ++j) {
-            float sum = 0;
-            for (int k = 0; k < OUTPUT_DIM; ++k)
-              sum += dY[i*OUTPUT_DIM + k]*W2[j*OUTPUT_DIM + k];
-            dY_hidden[i*HIDDEN_DIM + j] = sum;
-          }
+        hidden_grad(dY, W2, dY_hidden, train_samples, HIDDEN_DIM, OUTPUT_DIM);
         leaky_relu_backward(dY_hidden, hidden, train_samples*HIDDEN_DIM, 0.01f);
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        // Backprop first layer
         dense_backward(dY_hidden, X, dW1, db1, train_samples, INPUT_DIM, HIDDEN_DIM, true);
+        
         CUDA_CHECK(cudaDeviceSynchronize());
         cudaFree(dY_hidden);
 

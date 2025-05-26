@@ -8,5 +8,6 @@ void softmax_forward(float* input, float* output, int batch, int dim);
 void compute_loss_and_gradient_cuda(const float* probs, const int* labels, float* dY, float* loss_array, int batch, int classes);
 void compute_accuracy_cuda(const float* probs, const int* labels, int* correct_array, int batch, int classes);
 void leaky_relu_backward(float* dY, float* hidden, int total, float alpha = 0.01f);
+void hidden_grad(const float* dY,const float* W2,float*       dY_hidden,int          batchSize,int          hiddenSize,int          outputSize);
 
 #endif

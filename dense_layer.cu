@@ -2,11 +2,11 @@
 #include <iostream>
 #include <cmath>
 
-// Leaky ReLU activation kernel (with a small negative slope alpha)
+// leaky ReLU layer
 __global__ void leaky_relu_kernel(float* A, int total, float alpha) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < total) {
-        A[idx] = (A[idx] > 0.0f) ? A[idx] : alpha * A[idx];
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; // compute global thread index
+    if (idx < total) { // bound check
+        A[idx] = (A[idx] > 0.0f) ? A[idx] : alpha * A[idx]; // keeps the positive value, multiplies the negative value with a small alpha
     }
 }
 
@@ -115,6 +115,42 @@ __global__ void accuracy_kernel(const float* probs, const int* labels, int* corr
     correct[i] = (max_idx == labels[i]) ? 1 : 0;
 }
 
+
+// Kernel: dY_hidden[n, h] = sum_k dY[n, k] * W2[h, k]
+__global__ void hidden_grad_kernel(
+    const float* __restrict__ dY,        // [batchSize, outputSize]
+    const float* __restrict__ W2,        // [hiddenSize, outputSize]
+    float*             dY_hidden,        // [batchSize, hiddenSize]
+    int batchSize,
+    int hiddenSize,
+    int outputSize
+) {
+    int idx   = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batchSize * hiddenSize;
+    if (idx >= total) return;
+
+    int n = idx / hiddenSize;  // sample index
+    int h = idx % hiddenSize;  // hidden feature index
+
+    // pointers to row n of dY, row h of W2
+    const float* dY_row = dY       + n * outputSize;
+    const float* W2_row = W2       + h * outputSize;
+
+    float sum = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < outputSize; ++k) {
+        sum += dY_row[k] * W2_row[k];
+    }
+
+    dY_hidden[idx] = sum;
+}
+
+
+
+
+
+
+
 // Forward pass function for dense layer
 void dense_forward(float* X, float* W, float* b, float* Y, int batch, int in_size, int out_size) {
     dim3 block(16, 16);
@@ -168,5 +204,14 @@ void leaky_relu_backward(float* dY, float* hidden, int total, float alpha = 0.01
     int blockSize = 256;
     int gridSize = (total + blockSize - 1) / blockSize;
     leaky_relu_backward_kernel<<<gridSize, blockSize>>>(dY, hidden, total, alpha);
+    cudaDeviceSynchronize();
+}
+
+
+void hidden_grad(const float* dY, const float* W2, float* dY_hidden, int batchSize, int hiddenSize, int outputSize) {
+    int total     = batchSize * hiddenSize;
+    int blockSize = 256;
+    int gridSize  = (total + blockSize - 1) / blockSize;
+    hidden_grad_kernel<<<gridSize, blockSize>>>(dY, W2, dY_hidden, batchSize, hiddenSize, outputSize);
     cudaDeviceSynchronize();
 }
