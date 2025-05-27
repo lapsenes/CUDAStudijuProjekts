@@ -2,37 +2,56 @@
 #include <iostream>
 #include <cmath>
 
-// leaky ReLU layer
-__global__ void leaky_relu_kernel(float* A, int total, float alpha) {
+// leaky ReLU forward kernel
+__global__ void leaky_relu_kernel(float* A, int total, float alpha) 
+// float* A - pointer to a contiguous array of total floats in device memory
+// int total - A element count
+// float alpha - leak factor
+{
     int idx = blockIdx.x * blockDim.x + threadIdx.x; // compute global thread index
     if (idx < total) { // bound check
         A[idx] = (A[idx] > 0.0f) ? A[idx] : alpha * A[idx]; // keeps the positive value, multiplies the negative value with a small alpha
     }
 }
 
-// Forward pass kernel for dense layer
-__global__ void forward_kernel(float* X, float* W, float* b, float* Y, int batch, int in_size, int out_size) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y; 
-    int col = blockIdx.x * blockDim.x + threadIdx.x; 
-
-    if (row < batch && col < out_size) {
-        float sum = 0.0f;
-        for (int i = 0; i < in_size; ++i) {
-            sum += X[row * in_size + i] * W[i * out_size + col];
-        }
-        Y[row * out_size + col] = sum + b[col];
-    }
-}
-
-// Leaky ReLU backward kernel
-__global__ void leaky_relu_backward_kernel(float* dY, float* hidden, int total, float alpha) {
+// leaky ReLU backward kernel
+__global__ void leaky_relu_backward_kernel(float* dY, float* hidden, int total, float alpha) 
+// float* dY - pointer to the gradient of loss regarding layers outputs in device memory
+// float* hidden - pointer to the pre-activation outputs (values before applying leaky ReLU) in device memory
+// int total - element count
+// float alpha - same leak factor
+{ 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < total) {
-        if (hidden[idx] <= 0.0f) {
-            dY[idx] *= alpha;  // If input <= 0, scale the gradient by alpha
+        if (idx < total) {
+            float derivative = (hidden[idx] > 0.0f ? 1.0f : alpha);
+            dY[idx] *= derivative;
+ }
+}
+
+
+// forward pass kernel for dense layer
+__global__ void forward_kernel(float* X, float* W, float* b, float* Y, int batch, int in_size, int out_size)
+// float* X       - pointer to input matrix [batch × in_size] in device memory
+// float* W       - pointer to weight matrix [in_size × out_size] in device memory
+// float* b       - pointer to bias vector [out_size] in device memory
+// float* Y       - pointer to output matrix [batch × out_size] in device memory
+// int   batch    - number of samples in the batch
+// int   in_size  - number of input features per sample
+// int   out_size - number of output features per sample
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y; // global batch index
+    int col = blockIdx.x * blockDim.x + threadIdx.x; // global output feature index
+
+    if (row < batch && col < out_size) { // boundary check
+        float sum = 0.0f; // accumulator for dot product
+        for (int i = 0; i < in_size; ++i) { // iterate over input values and sum their multiplications with associated weights
+            sum += X[row * in_size + i] // load one of the input values
+                 * W[i * out_size + col]; // load the associated weight
         }
+        Y[row * out_size + col] = sum + b[col]; // write output + add bias
     }
 }
+
 
 // Backward pass kernel for dense layer (computing dW and db)
 __global__ void backward_kernel(float* dY, float* X, float* dW, float* db, int batch, int in_size, int out_size, bool use_leaky_relu = false, float alpha = 0.01f) {
@@ -54,31 +73,32 @@ __global__ void backward_kernel(float* dY, float* X, float* dW, float* db, int b
         }
         db[j] = bias_grad / batch;
     }
-
-    // If using Leaky ReLU, adjust the gradient calculation
-    if (use_leaky_relu && i < in_size && j < out_size) {
-        // Leaky ReLU gradient adjustment: if the input was <= 0, multiply the gradient by alpha
-        if (X[i] <= 0.0f) {
-            dY[i] *= alpha;  // Adjust the gradient for the dead neurons (Leaky ReLU)
-        }
-    }
 }
 
-// Softmax kernel (used after the output layer)
-__global__ void softmax_kernel(float* input, float* output, int batch, int dim) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x; 
-    if (i >= batch) return;
-
-    float max_val = input[i * dim];
-    for (int j = 1; j < dim; ++j) {
+// softmax kernel (used after the dense layer)
+__global__ void softmax_kernel(float* input, float* output, int batch, int dim)
+// float* input - pointer to input logits matrix [batch × dim] in device memory
+// float* output - pointer to output probabilities matrix [batch × dim] in device memory
+// int batch - number of samples in the batch
+// int dim - number of classes (features) per sample
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x; // global sample index
+    if (i >= batch) return; // boundary check
+    // find the maximum logit in this sample to prevent overflow when calculating e^x
+    float max_val = input[i * dim]; // start with first class
+    for (int j = 1; j < dim; ++j) { // find the max logit
         max_val = fmaxf(max_val, input[i * dim + j]);
     }
 
+    // compute exponentials shifted by max_val, and accumulate their sum
     float sum_exp = 0.0f;
     for (int j = 0; j < dim; ++j) {
-        output[i * dim + j] = expf(input[i * dim + j] - max_val);
-        sum_exp += output[i * dim + j];
+        float e = expf(input[i * dim + j] - max_val);
+        output[i * dim + j] = e; // store temporary 
+        sum_exp += e; // accumulate 
     }
+
+    // normalize
     for (int j = 0; j < dim; ++j) {
         output[i * dim + j] /= sum_exp;
     }

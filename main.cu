@@ -19,7 +19,7 @@
 #define CLIP_VALUE  5.0f
 #define LAMBDA      1e-4f
 
-// Helper macro for CUDA error checking
+// helper macro for CUDA error checking
 #define CUDA_CHECK(call)                                                       \
   do {                                                                         \
     cudaError_t err = call;                                                    \
@@ -107,6 +107,7 @@ void test_model(float* X_test, float* W1, float* b1, float* W2, float* b2,
 }
 
 int main() {
+    // load mnist dataset
     std::vector<float> full_X;
     std::vector<int>   full_y;
     if (!read_mnist_csv("data/mnist.csv", full_X, full_y)) {
@@ -114,13 +115,12 @@ int main() {
         return 1;
     }
 
-    
-
+    // initialize some main variable
     int total_samples = full_y.size();
     int train_samples = int(total_samples * TRAIN_RATIO);
     int test_samples  = total_samples - train_samples;
 
-    // Build dataset
+    // build dataset in 1D array
     std::vector<std::pair<std::vector<float>,int>> dataset(total_samples);
     for (int i = 0; i < total_samples; ++i) {
         dataset[i].first.assign(
@@ -130,14 +130,14 @@ int main() {
         dataset[i].second = full_y[i];
     }
 
-    // Manual Fisher–Yates shuffle
+    // manual Fisher–Yates shuffle
     std::srand(static_cast<unsigned>(time(nullptr)));
     for (int i = total_samples - 1; i > 0; --i) {
         int j = std::rand() % (i + 1);
         std::swap(dataset[i], dataset[j]);
     }
 
-    // Split X/y
+    // split train/test
     std::vector<float> X_train(train_samples*INPUT_DIM), X_test_vec(test_samples*INPUT_DIM);
     std::vector<int>   y_train(train_samples),       y_test(test_samples);
     for (int i = 0; i < train_samples; ++i) {
@@ -152,7 +152,7 @@ int main() {
         y_test[i] = dataset[train_samples+i].second;
     }
 
-    // Normalize
+    // normalize all data based on train data statistics
     for (int j = 0; j < INPUT_DIM; ++j) {
         double sum = 0, sum_sq = 0;
         for (int i = 0; i < train_samples; ++i) {
@@ -167,14 +167,14 @@ int main() {
             X_test_vec[i*INPUT_DIM + j] = (X_test_vec[i*INPUT_DIM + j] - mean) / stdv;
     }
 
-    // Allocate model parameters
+    // allocate memory for weights and bias
     float *W1, *b1, *W2, *b2;
     CUDA_CHECK(cudaMallocManaged(&W1, INPUT_DIM*HIDDEN_DIM*sizeof(float)));
     CUDA_CHECK(cudaMallocManaged(&b1, HIDDEN_DIM*sizeof(float)));
     CUDA_CHECK(cudaMallocManaged(&W2, HIDDEN_DIM*OUTPUT_DIM*sizeof(float)));
     CUDA_CHECK(cudaMallocManaged(&b2, OUTPUT_DIM*sizeof(float)));
 
-    // He initialization
+    // He initialization of weights and 0 init for bias
     std::mt19937 rng{std::random_device{}()};
     std::uniform_real_distribution<float> dist(-0.1f,0.1f);
     float scale = std::sqrt(2.0f/INPUT_DIM);
@@ -183,51 +183,50 @@ int main() {
     for (int i = 0; i < HIDDEN_DIM*OUTPUT_DIM; ++i) W2[i] = dist(rng)*scale;
     for (int i = 0; i < OUTPUT_DIM; ++i) b2[i] = 0;
 
-    // Allocate training buffers
+    // allocate training buffers
     float *X, *hidden, *logits, *probs, *dY;
     int   *d_y_train;
-    CUDA_CHECK(cudaMallocManaged(&X,      train_samples*INPUT_DIM*sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&X, train_samples*INPUT_DIM*sizeof(float)));
     CUDA_CHECK(cudaMallocManaged(&hidden, train_samples*HIDDEN_DIM*sizeof(float)));
     CUDA_CHECK(cudaMallocManaged(&logits, train_samples*OUTPUT_DIM*sizeof(float)));
-    CUDA_CHECK(cudaMallocManaged(&probs,  train_samples*OUTPUT_DIM*sizeof(float)));
-    CUDA_CHECK(cudaMallocManaged(&dY,     train_samples*OUTPUT_DIM*sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&probs, train_samples*OUTPUT_DIM*sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&dY, train_samples*OUTPUT_DIM*sizeof(float)));
     CUDA_CHECK(cudaMallocManaged(&d_y_train, train_samples*sizeof(int)));
 
-    std::copy(X_train.begin(), X_train.end(), X);
-    std::copy(y_train.begin(), y_train.end(), d_y_train);
+    std::copy(X_train.begin(), X_train.end(), X); // features
+    std::copy(y_train.begin(), y_train.end(), d_y_train); // class
 
-    // Gradients & loss arrays
+    // allocate memory for weight and bias gradients as well as loss
     float *dW1, *db1, *dW2, *db2, *loss_array;
     int   *correct_array;
-    CUDA_CHECK(cudaMallocManaged(&dW1,       INPUT_DIM*HIDDEN_DIM*sizeof(float)));
-    CUDA_CHECK(cudaMallocManaged(&db1,       HIDDEN_DIM*sizeof(float)));
-    CUDA_CHECK(cudaMallocManaged(&dW2,       HIDDEN_DIM*OUTPUT_DIM*sizeof(float)));
-    CUDA_CHECK(cudaMallocManaged(&db2,       OUTPUT_DIM*sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&dW1, INPUT_DIM*HIDDEN_DIM*sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&db1, HIDDEN_DIM*sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&dW2, HIDDEN_DIM*OUTPUT_DIM*sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&db2, OUTPUT_DIM*sizeof(float)));
     CUDA_CHECK(cudaMallocManaged(&loss_array,train_samples*sizeof(float)));
     CUDA_CHECK(cudaMallocManaged(&correct_array, train_samples*sizeof(int)));
 
+    // start timer for training
     auto t0 = std::chrono::high_resolution_clock::now();
 
     for (int epoch = 0; epoch < EPOCHS; ++epoch) {
-        // Forward
-        dense_forward(X,  W1, b1, hidden, train_samples, INPUT_DIM, HIDDEN_DIM);
+        // forward + leaky relu + forward + softmax
+        dense_forward(X, W1, b1, hidden, train_samples, INPUT_DIM, HIDDEN_DIM);
         leaky_relu_forward(hidden, train_samples*HIDDEN_DIM);
         dense_forward(hidden, W2, b2, logits, train_samples, HIDDEN_DIM, OUTPUT_DIM);
         softmax_forward(logits, probs, train_samples, OUTPUT_DIM);
 
-        // Loss & gradient
+        // loss & gradient
         compute_loss_and_gradient_cuda(probs, d_y_train, dY, loss_array, train_samples, OUTPUT_DIM);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // Compute epoch loss
+        // epoch loss - average over samples
         double loss = 0;
         for (int i = 0; i < train_samples; ++i) loss += loss_array[i];
         loss /= train_samples;
 
-        // Backprop second layer
+        // backprop second layer + hidden grad + leaky relu + backprop first layer 
         dense_backward(dY, hidden, dW2, db2, train_samples, HIDDEN_DIM, OUTPUT_DIM, true);
-
-        // Hidden grad on CPU + Leaky back
         float* dY_hidden;
         CUDA_CHECK(cudaMallocManaged(&dY_hidden, train_samples*HIDDEN_DIM*sizeof(float)));
         hidden_grad(dY, W2, dY_hidden, train_samples, HIDDEN_DIM, OUTPUT_DIM);
@@ -237,7 +236,7 @@ int main() {
         CUDA_CHECK(cudaDeviceSynchronize());
         cudaFree(dY_hidden);
 
-        // Update weights
+        // update weights and biases based on the gradients
         for (int i = 0; i < INPUT_DIM*HIDDEN_DIM; ++i)
           W1[i] -= LR*(fminf(fmaxf(dW1[i], -CLIP_VALUE), CLIP_VALUE) + LAMBDA*W1[i]);
         for (int i = 0; i < HIDDEN_DIM; ++i)
@@ -247,6 +246,7 @@ int main() {
         for (int i = 0; i < OUTPUT_DIM; ++i)
           b2[i] -= LR*fminf(fmaxf(db2[i], -CLIP_VALUE), CLIP_VALUE);
 
+        // for n epochs calculate accuracy and print out statistics
         if (epoch % 10 == 0 || epoch == EPOCHS-1) {
           compute_accuracy_cuda(probs, d_y_train, correct_array, train_samples, OUTPUT_DIM);
           CUDA_CHECK(cudaDeviceSynchronize());
@@ -258,22 +258,22 @@ int main() {
                     << "\n";
         }
     }
-
+    // stop timer for training
     auto t1 = std::chrono::high_resolution_clock::now();
     std::cout << "Training Time: "
               << std::chrono::duration<double>(t1-t0).count() << "s\n";
 
-    // Test
+    // final accuracy test on test data
     float* X_test_dev;  int* y_test_dev;
     CUDA_CHECK(cudaMallocManaged(&X_test_dev, test_samples*INPUT_DIM*sizeof(float)));
     CUDA_CHECK(cudaMallocManaged(&y_test_dev, test_samples*sizeof(int)));
     std::copy(X_test_vec.begin(), X_test_vec.end(), X_test_dev);
-    std::copy(y_test.begin(),    y_test.end(),    y_test_dev);
+    std::copy(y_test.begin(), y_test.end(), y_test_dev);
 
     test_model(X_test_dev, W1, b1, W2, b2, y_test_dev,
                test_samples, INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM);
 
-    // Cleanup
+    // memory cleanup
     cudaFree(X_test_dev); cudaFree(y_test_dev);
     cudaFree(X); cudaFree(hidden); cudaFree(logits); cudaFree(probs);
     cudaFree(dY); cudaFree(d_y_train);
