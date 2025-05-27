@@ -23,6 +23,17 @@ __global__ void relu_kernel(float* A, int total) {
     }
 }
 
+__global__ void relu_backward_kernel(
+    float*       dY_hidden,  // [batch × HIDDEN_DIM]
+    const float* hidden,     // pre‐ReLU activations [batch × HIDDEN_DIM]
+    int total
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total && hidden[idx] <= 0.0f) {
+        dY_hidden[idx] = 0.0f;
+    }
+}
+
 // Softmax kernel, operates per row (sample)
 __global__ void softmax_kernel(float* input, float* output, int batch, int dim) {
     int i = blockIdx.x * blockDim.x + threadIdx.x; // row index
@@ -66,6 +77,32 @@ __global__ void backward_kernel(float* dY, float* X, float* dW, float* db, int b
         }
         db[j] = bias_grad / batch;
     }
+}
+
+__global__ void hidden_grad_kernel(
+    const float* __restrict__ dY,  
+    const float* __restrict__ W2,  
+    float*             dY_hidden,   
+    int batch,
+    int hiddenSize,
+    int outputSize
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * hiddenSize;
+    if (idx >= total) return;
+
+    int n = idx / hiddenSize;   // sample index
+    int h = idx % hiddenSize;   // hidden‐unit index
+
+    const float* dY_row = dY       + n * outputSize;
+    const float* W2_row = W2       + h * outputSize;
+
+    float sum = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < outputSize; ++k) {
+        sum += dY_row[k] * W2_row[k];
+    }
+    dY_hidden[idx] = sum;
 }
 
 
@@ -144,5 +181,25 @@ void compute_accuracy_cuda(const float* probs, const int* labels, int* correct_a
     int blockSize = 256;
     int gridSize = (batch + blockSize - 1) / blockSize;
     accuracy_kernel<<<gridSize, blockSize>>>(probs, labels, correct_array, batch, classes);
+    cudaDeviceSynchronize();
+}
+
+void hidden_grad(
+    const float* dY, const float* W2, float* dY_hidden,
+    int batch, int hiddenSize, int outputSize
+) {
+    int total     = batch * hiddenSize;
+    int blockSize = 256;
+    int gridSize  = (total + blockSize - 1) / blockSize;
+    hidden_grad_kernel<<<gridSize, blockSize>>>(
+        dY, W2, dY_hidden, batch, hiddenSize, outputSize
+    );
+    cudaDeviceSynchronize();
+}
+
+void relu_backward(float* dY_hidden, const float* hidden, int total) {
+    int blockSize = 256;
+    int gridSize  = (total + blockSize - 1) / blockSize;
+    relu_backward_kernel<<<gridSize, blockSize>>>(dY_hidden, hidden, total);
     cudaDeviceSynchronize();
 }

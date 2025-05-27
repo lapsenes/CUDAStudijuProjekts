@@ -16,8 +16,8 @@
 #define INPUT_DIM 4
 #define HIDDEN_DIM 6
 #define OUTPUT_DIM 3
-#define EPOCHS 600
-#define LR 0.1f
+#define EPOCHS 1000
+#define LR 0.01f
 #define TRAIN_RATIO 0.8f
 
 // value mapping for labels
@@ -68,17 +68,11 @@ bool read_csv_data(const std::string& filename, std::vector<float>& X, std::vect
 }
 
 
-
-
-
 // main
-
-
-
 int main() {
     std::vector<float> full_X;
     std::vector<int> full_y;
-    if (!read_csv_data("iris.csv", full_X, full_y)) { // load the specific dataset
+    if (!read_csv_data("data/iris.csv", full_X, full_y)) { // load the specific dataset
         std::cerr << "Failed to load iris.csv\n";
         return 1;
     }
@@ -159,6 +153,9 @@ int main() {
     cudaMallocManaged(&dY, train_samples * OUTPUT_DIM * sizeof(float));
     std::copy(X_train.begin(), X_train.end(), X);
 
+    float* dY_hidden;
+    cudaMallocManaged(&dY_hidden, train_samples * HIDDEN_DIM * sizeof(float));
+
     int* d_y_train;
     cudaMallocManaged(&d_y_train, train_samples * sizeof(int));
     std::copy(y_train.begin(), y_train.end(), d_y_train);
@@ -194,8 +191,11 @@ int main() {
         for (int i = 0; i < train_samples; ++i) loss += loss_array[i];
         loss /= train_samples;
 
+
         dense_backward(dY, hidden, dW2, db2, train_samples, HIDDEN_DIM, OUTPUT_DIM);
-        dense_backward(dY, X, dW1, db1, train_samples, INPUT_DIM, HIDDEN_DIM);
+        hidden_grad(dY, W2, dY_hidden, train_samples, HIDDEN_DIM, OUTPUT_DIM);
+        relu_backward(dY_hidden, hidden, train_samples * HIDDEN_DIM);
+        dense_backward(dY_hidden, X, dW1, db1, train_samples, INPUT_DIM, HIDDEN_DIM);
 
         for (int i = 0; i < INPUT_DIM * HIDDEN_DIM; ++i) W1[i] -= LR * (fminf(fmaxf(dW1[i], -clip), clip) + lambda * W1[i]);
         for (int i = 0; i < HIDDEN_DIM; ++i) b1[i] -= LR * fminf(fmaxf(db1[i], -clip), clip);
