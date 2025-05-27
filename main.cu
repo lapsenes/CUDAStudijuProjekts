@@ -27,8 +27,6 @@ std::unordered_map<std::string, int> label_map = {
     {"Iris-virginica", 2}
 };
 
-
-
 std::string trim(const std::string& s) {
     size_t start = s.find_first_not_of(" \t\r\n");
     size_t end = s.find_last_not_of(" \t\r\n");
@@ -190,7 +188,6 @@ int main() {
         float loss = 0.0f;
         for (int i = 0; i < train_samples; ++i) loss += loss_array[i];
         loss /= train_samples;
-
 
         dense_backward(dY, hidden, dW2, db2, train_samples, HIDDEN_DIM, OUTPUT_DIM);
         hidden_grad(dY, W2, dY_hidden, train_samples, HIDDEN_DIM, OUTPUT_DIM);

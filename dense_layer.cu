@@ -137,7 +137,6 @@ __global__ void accuracy_kernel(const float* probs, const int* labels, int* corr
 }
 
 
-
 // Launches forward kernel
 void dense_forward(float* X, float* W, float* b, float* Y, int batch, int in_size, int out_size) {
     dim3 block(16, 16);
