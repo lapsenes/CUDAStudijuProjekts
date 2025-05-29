@@ -6,6 +6,7 @@
         "type": "shell",
         "command": "/usr/local/cuda/bin/nvcc",
         "args": [
+          "-std=c11", 
           "-g", "-G",
           "main.cu", "dense_layer.cu",
           "-o", "main"

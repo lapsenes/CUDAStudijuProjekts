@@ -53,27 +53,43 @@ __global__ void forward_kernel(float* X, float* W, float* b, float* Y, int batch
 }
 
 
-// Backward pass kernel for dense layer (computing dW and db)
-__global__ void backward_kernel(float* dY, float* X, float* dW, float* db, int batch, int in_size, int out_size, bool use_leaky_relu = false, float alpha = 0.01f) {
-    int i = blockIdx.y * blockDim.y + threadIdx.y;  // input feature index
-    int j = blockIdx.x * blockDim.x + threadIdx.x;  // output neuron index
+// backward_kernel - computes gradients for a dense (fully connected) layer during backpropagation
+__global__ void backward_kernel(float* dY, float* X, float* dW, float* db, int batch, int in_size, int out_size, bool use_leaky_relu = false, float alpha = 0.01f)
+// float* dY - gradient of the loss w.r.t. the output of the dense layer [batch × out_size]
+// float* X - input activations to the dense layer [batch × in_size]
+// float* dW - output: gradient w.r.t. weights [in_size × out_size]
+// float* db - output: gradient w.r.t. biases [out_size]
+// int batch - number of samples in the batch
+// int in_size - number of input features (neurons before the dense layer)
+// int out_size - number of output features (neurons after the dense layer)
+// bool use_leaky_relu - unused in this kernel (possibly for activation backward later)
+// float alpha - leaky ReLU slope (unused here)
+{
+    int i = blockIdx.y * blockDim.y + threadIdx.y; // input neuron index (row of weight matrix)
+    int j = blockIdx.x * blockDim.x + threadIdx.x; // output neuron index (column of weight matrix)
 
+    // Compute dW[i][j]: gradient of the loss w.r.t. weight from input i to output j
     if (i < in_size && j < out_size) {
         float grad = 0.0f;
         for (int n = 0; n < batch; ++n) {
+            // Accumulate gradient across batch:
+            // dW[i][j] += X[n][i] * dY[n][j]
             grad += X[n * in_size + i] * dY[n * out_size + j];
         }
-        dW[i * out_size + j] = grad / batch;
+        dW[i * out_size + j] = grad / batch; // average over batch
     }
 
-    if (i == 0 && j < out_size) {
+    // Compute db[j]: gradient of the loss w.r.t. bias at output neuron j
+    if (i == 0 && j < out_size) { // only one thread per j handles db[j]
         float bias_grad = 0.0f;
         for (int n = 0; n < batch; ++n) {
+            // db[j] += dY[n][j]
             bias_grad += dY[n * out_size + j];
         }
-        db[j] = bias_grad / batch;
+        db[j] = bias_grad / batch; // average over batch
     }
 }
+
 
 // softmax kernel (used after the dense layer)
 __global__ void softmax_kernel(float* input, float* output, int batch, int dim)
@@ -104,64 +120,94 @@ __global__ void softmax_kernel(float* input, float* output, int batch, int dim)
     }
 }
 
-// Loss gradient kernel for cross-entropy loss and backpropagation
-__global__ void loss_gradient_kernel(const float* probs, const int* labels, float* dY, float* loss, int batch, int classes) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= batch) return;
+// loss_gradient_kernel - computes gradient of cross-entropy loss w.r.t. softmax output, and per-sample loss value
+__global__ void loss_gradient_kernel(const float* probs, const int* labels, float* dY, float* loss, int batch, int classes)
+// const float* probs - pointer to predicted class probabilities [batch × classes] from softmax (device memory)
+// const int* labels - pointer to true class indices [batch] (device memory)
+// float* dY - pointer to gradient output [batch × classes], i.e., dL/d(logits)
+// float* loss - pointer to per-sample loss output [batch]
+// int batch - number of samples
+// int classes - number of classes per sample
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x; // global sample index
+    if (i >= batch) return; // boundary check
+    int label = labels[i]; // get true class label for this sample
+    // compute negative log likelihood loss for this sample:
+    // loss = -log(p_label), where p_label is the predicted probability for the true class
+    float sample_loss = -logf(probs[i * classes + label] + 1e-8f); // add small epsilon for numerical stability
+    loss[i] = sample_loss; // store the loss
 
-    int label = labels[i];
-    float sample_loss = -logf(probs[i * classes + label] + 1e-8f); // Log with small epsilon for numerical stability
-    loss[i] = sample_loss;
-
+    // compute gradient of cross-entropy loss w.r.t. softmax input (probabilities):
+    // dL/dy_j = y_j - 1 if j == label, else y_j
     for (int j = 0; j < classes; ++j) {
-        dY[i * classes + j] = probs[i * classes + j] - (label == j ? 1.0f : 0.0f);
+        float target = (j == label) ? 1.0f : 0.0f; // 1.0 only at true class index
+        dY[i * classes + j] = probs[i * classes + j] - target; // gradient of loss w.r.t. probs
     }
 }
 
-// Accuracy kernel
-__global__ void accuracy_kernel(const float* probs, const int* labels, int* correct, int batch, int classes) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= batch) return;
 
-    int max_idx = 0;
-    float max_val = probs[i * classes];
+// accuracy_kernel - computes per-sample accuracy (1 if prediction correct, 0 otherwise)
+__global__ void accuracy_kernel(const float* probs, const int* labels, int* correct, int batch, int classes)
+// const float* probs - pointer to predicted probabilities [batch × classes] from softmax
+// const int* labels - pointer to ground truth class indices [batch]
+// int* correct - output array [batch], where correct[i] = 1 if prediction matches label, else 0
+// int batch - number of samples in the batch
+// int classes - number of output classes
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x; // global sample index
+    if (i >= batch) return; // boundary check
+
+    // Find the class with the highest predicted probability (argmax)
+    int max_idx = 0; // index of highest probability class
+    float max_val = probs[i * classes]; // initial max value
+
     for (int j = 1; j < classes; ++j) {
-        float val = probs[i * classes + j];
-        if (val > max_val) {
+        float val = probs[i * classes + j]; // probability for class j
+        if (val > max_val) { // found a higher probability
             max_val = val;
-            max_idx = j;
+            max_idx = j; // update max index
         }
     }
-    correct[i] = (max_idx == labels[i]) ? 1 : 0;
+
+    // Compare predicted class (max_idx) with ground truth label
+    correct[i] = (max_idx == labels[i]) ? 1 : 0; // store 1 if correct, else 0
 }
 
 
-// Kernel: dY_hidden[n, h] = sum_k dY[n, k] * W2[h, k]
+
+// hidden_grad_kernel - computes gradient of the loss w.r.t. hidden layer output (before activation)
+// dY_hidden[n, h] = sum over k of dY[n, k] * W2[h, k], i.e., backpropagation through dense layer
 __global__ void hidden_grad_kernel(
-    const float* __restrict__ dY,        // [batchSize, outputSize]
-    const float* __restrict__ W2,        // [hiddenSize, outputSize]
-    float*             dY_hidden,        // [batchSize, hiddenSize]
-    int batchSize,
-    int hiddenSize,
-    int outputSize
-) {
-    int idx   = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = batchSize * hiddenSize;
-    if (idx >= total) return;
+    const float* __restrict__ dY,        // [batchSize × outputSize] - gradient from next layer
+    const float* __restrict__ W2,        // [hiddenSize × outputSize] - weights of next layer
+    float*             dY_hidden,        // [batchSize × hiddenSize] - output: gradient w.r.t. hidden layer output
+    int batchSize,                       // number of samples
+    int hiddenSize,                      // number of neurons in the hidden layer
+    int outputSize                       // number of output neurons
+)
+{
+    int idx   = blockIdx.x * blockDim.x + threadIdx.x; // global flat index
+    int total = batchSize * hiddenSize; // total number of (sample, hidden) pairs
+    if (idx >= total) return; // boundary check
 
-    int n = idx / hiddenSize;  // sample index
-    int h = idx % hiddenSize;  // hidden feature index
+    int n = idx / hiddenSize; // sample index
+    int h = idx % hiddenSize; // hidden neuron index
 
-    // pointers to row n of dY, row h of W2
-    const float* dY_row = dY       + n * outputSize;
-    const float* W2_row = W2       + h * outputSize;
+    // Row pointer to dY[n] (gradient vector from output layer)
+    const float* dY_row = dY + n * outputSize;
 
+    // Row pointer to W2[h] (weights connecting hidden neuron h to all outputs)
+    const float* W2_row = W2 + h * outputSize;
+
+    // Compute the dot product:
+    // dY_hidden[n][h] = sum_k (dY[n][k] * W2[h][k])
     float sum = 0.0f;
     #pragma unroll
     for (int k = 0; k < outputSize; ++k) {
         sum += dY_row[k] * W2_row[k];
     }
 
+    // Store the result
     dY_hidden[idx] = sum;
 }
 
